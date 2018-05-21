@@ -4,18 +4,11 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.fasterxml.jackson.databind.node.ObjectNode;
-import com.squareup.okhttp.OkHttpClient;
-import com.squareup.okhttp.Request;
-import com.squareup.okhttp.RequestBody;
-import com.squareup.okhttp.Response;
-import com.squareup.okhttp.ResponseBody;
-import com.squareup.okhttp.ws.WebSocket;
-import com.squareup.okhttp.ws.WebSocketCall;
-import com.squareup.okhttp.ws.WebSocketListener;
 
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
@@ -23,18 +16,25 @@ import java.util.Set;
 import java.util.Timer;
 import java.util.TimerTask;
 import java.util.WeakHashMap;
-import java.util.concurrent.ConcurrentLinkedDeque;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.logging.Level;
-import java.util.logging.Logger;
 
-import javax.net.ssl.HostnameVerifier;
-import javax.net.ssl.SSLSocketFactory;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-import okio.Buffer;
+import okhttp3.MediaType;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.RequestBody;
+import okhttp3.Response;
+import okhttp3.WebSocket;
+import okhttp3.WebSocketListener;
+import okio.ByteString;
 
 
 public class Socket {
-    private static final Logger LOG = Logger.getLogger(Socket.class.getName());
+
+    private static final Logger log = LoggerFactory.getLogger(Socket.class);
 
     public static final int RECONNECT_INTERVAL_MS = 5000;
 
@@ -55,26 +55,24 @@ public class Socket {
     private TimerTask reconnectTimerTask = null;
     private TimerTask heartbeatTimerTask = null;
 
-    private Set<ISocketOpenCallback> socketOpenCallbacks = Collections.newSetFromMap(new WeakHashMap<ISocketOpenCallback, Boolean>());
-    private Set<ISocketCloseCallback> socketCloseCallbacks = Collections.newSetFromMap(new WeakHashMap<ISocketCloseCallback, Boolean>());
-    private Set<IErrorCallback> errorCallbacks = Collections.newSetFromMap(new WeakHashMap<IErrorCallback, Boolean>());
-    private Set<IMessageCallback> messageCallbacks = Collections.newSetFromMap(new WeakHashMap<IMessageCallback, Boolean>());
+    private Set<ISocketOpenCallback> socketOpenCallbacks = Collections.newSetFromMap(new HashMap<ISocketOpenCallback, Boolean>());
+    private Set<ISocketCloseCallback> socketCloseCallbacks = Collections.newSetFromMap(new HashMap<ISocketCloseCallback, Boolean>());
+    private Set<IErrorCallback> errorCallbacks = Collections.newSetFromMap(new HashMap<IErrorCallback, Boolean>());
+    private Set<IMessageCallback> messageCallbacks = Collections.newSetFromMap(new HashMap<IMessageCallback, Boolean>());
 
     private int refNo = 1;
 
     /**
      * Annotated WS Endpoint. Private member to prevent confusion with "onConn*" registration methods.
      */
-    private PhoenixWSListener wsListener = new PhoenixWSListener();
-    private ConcurrentLinkedDeque<RequestBody> sendBuffer = new ConcurrentLinkedDeque<>();
+    private final PhoenixWSListener wsListener = new PhoenixWSListener();
+    private final LinkedBlockingQueue<RequestBody> sendBuffer = new LinkedBlockingQueue<>();
 
-    public class PhoenixWSListener implements WebSocketListener {
-        private PhoenixWSListener() {
-        }
+    public class PhoenixWSListener extends WebSocketListener {
 
         @Override
-        public void onOpen(final WebSocket webSocket, final Response response) {
-            LOG.log(Level.FINE, "WebSocket onOpen: {0}", webSocket);
+        public void onOpen(WebSocket webSocket, Response response) {
+            log.trace("WebSocket onOpen: {0}", webSocket);
             Socket.this.webSocket = webSocket;
             cancelReconnectTimer();
 
@@ -84,77 +82,64 @@ public class Socket {
                 callback.onOpen();
             }
 
-            Socket.this.flushSendBuffer();
+            flushSendBuffer();
         }
 
         @Override
-        public void onMessage(final ResponseBody payload) throws IOException {
-            LOG.log(Level.FINE, "Envelope received: {0}", payload);
-
+        public void onMessage(WebSocket webSocket, String text) {
             try {
-                if (payload.contentType() == WebSocket.TEXT) {
-                    final Envelope envelope =
-                            objectMapper.readValue(payload.byteStream(), Envelope.class);
-                    for (final Channel channel : getChannels()) {
-                        if (channel.isMember(envelope)) {
+                final Envelope envelope = objectMapper.readValue(text, Envelope.class);
+                synchronized (channels) {
+                    for (final Channel channel : channels) {
+
+                        if (channel.isMember(envelope.getTopic())) {
                             channel.trigger(envelope.getEvent(), envelope);
                         }
                     }
+                }
 
-                    for (final IMessageCallback callback : messageCallbacks) {
-                        callback.onMessage(envelope);
-                    }
+                for (final IMessageCallback callback : messageCallbacks) {
+                    callback.onMessage(envelope);
                 }
             } catch (IOException e) {
-                LOG.log(Level.SEVERE, "Failed to read message payload", e);
-            } finally {
-                payload.close();
+                log.trace("Failed to read message payload", e);
             }
         }
 
         @Override
-        public void onPong(final Buffer payload) {
-            LOG.log(Level.INFO, "PONG received: {0}", payload);
+        public void onMessage(WebSocket webSocket, ByteString bytes) {
+            onMessage(webSocket, bytes.toString());
         }
 
         @Override
-        public void onClose(final int code, final String reason) {
-            LOG.log(Level.FINE, "WebSocket onClose {0}/{1}", new Object[]{code, reason});
-            Socket.this.webSocket = null;
+        public void onClosing(WebSocket webSocket, int code, String reason) {
+        }
 
+        @Override
+        public void onClosed(WebSocket webSocket, int code, String reason) {
+            Socket.this.webSocket = null;
             for (final ISocketCloseCallback callback : socketCloseCallbacks) {
                 callback.onClose();
             }
         }
 
         @Override
-        public void onFailure(final IOException e, final Response response) {
-            LOG.log(Level.WARNING, "WebSocket connection error", e);
+        public void onFailure(WebSocket webSocket, Throwable t, Response response) {
             try {
+                //TODO if there are multiple errorCallbacks do we really want to trigger
+                //the same channel error callbacks multiple times?
+                triggerChannelError();
                 for (final IErrorCallback callback : errorCallbacks) {
-
-                    //TODO if there are multiple errorCallbacks do we really want to trigger
-                    //the same channel error callbacks multiple times?
-                    triggerChannelError();
-                    callback.onError(e.toString());
+                    callback.onError(t.getMessage());
                 }
-            }
-            finally {
+            } finally {
                 // Assume closed on failure
-                if(Socket.this.webSocket != null) {
+                if (Socket.this.webSocket != null) {
                     try {
                         Socket.this.webSocket.close(1001 /*CLOSE_GOING_AWAY*/, "EOF received");
-                    } catch (IOException ioe) {
-                        LOG.log(Level.WARNING, "Failed to explicitly close following failure");
                     } finally {
                         Socket.this.webSocket = null;
                     }
-                }
-                if (reconnectOnFailure) {
-                    scheduleReconnectTimer();
-                } else {
-                    cancelReconnectTimer();
-                    cancelHeartbeatTimer();
                 }
             }
         }
@@ -166,19 +151,18 @@ public class Socket {
         }
     }
 
-    private void startHeartbeatTimer(){
+    private void startHeartbeatTimer() {
         Socket.this.heartbeatTimerTask = new TimerTask() {
             @Override
             public void run() {
-                LOG.log(Level.FINE, "heartbeatTimerTask run");
-                if(Socket.this.isConnected()) {
+                log.trace("heartbeatTimerTask run");
+                if (isConnected()) {
                     try {
                         Envelope envelope = new Envelope("phoenix", "heartbeat",
-                        new ObjectNode(JsonNodeFactory.instance), Socket.this.makeRef(), null);
-                        Socket.this.push(envelope);
-                    }
-                    catch (Exception e) {
-                        LOG.log(Level.SEVERE, "Failed to send heartbeat", e);
+                                new ObjectNode(JsonNodeFactory.instance), makeRef(), null);
+                        push(envelope);
+                    } catch (Exception e) {
+                        log.trace("Failed to send heartbeat", e);
                     }
                 }
             }
@@ -187,7 +171,7 @@ public class Socket {
         timer.schedule(Socket.this.heartbeatTimerTask, Socket.this.heartbeatInterval, Socket.this.heartbeatInterval);
     }
 
-    private void cancelHeartbeatTimer(){
+    private void cancelHeartbeatTimer() {
         if (Socket.this.heartbeatTimerTask != null) {
             Socket.this.heartbeatTimerTask.cancel();
         }
@@ -203,11 +187,11 @@ public class Socket {
         Socket.this.reconnectTimerTask = new TimerTask() {
             @Override
             public void run() {
-                LOG.log(Level.FINE, "reconnectTimerTask run");
+                log.trace("reconnectTimerTask run");
                 try {
-                    Socket.this.connect();
+                    connect();
                 } catch (Exception e) {
-                    LOG.log(Level.SEVERE, "Failed to reconnect to " + Socket.this.wsListener, e);
+                    log.trace("Failed to reconnect to " + Socket.this.wsListener, e);
                 }
             }
         };
@@ -215,8 +199,8 @@ public class Socket {
     }
 
     private void cancelReconnectTimer() {
-        if (Socket.this.reconnectTimerTask != null) {
-            Socket.this.reconnectTimerTask.cancel();
+        if (this.reconnectTimerTask != null) {
+            this.reconnectTimerTask.cancel();
         }
     }
 
@@ -235,14 +219,14 @@ public class Socket {
     }
 
     public Socket(final String endpointUri, final int heartbeatIntervalInMs) throws IOException {
-        LOG.log(Level.FINE, "PhoenixSocket({0})", endpointUri);
+        log.trace("PhoenixSocket({0})", endpointUri);
         this.endpointUri = endpointUri;
         this.heartbeatInterval = heartbeatIntervalInMs;
         this.timer = new Timer("Reconnect Timer for " + endpointUri);
     }
 
     public void disconnect() throws IOException {
-        LOG.log(Level.FINE, "disconnect");
+        log.trace("disconnect");
         if (webSocket != null) {
             webSocket.close(1001 /*CLOSE_GOING_AWAY*/, "Disconnected by client");
         }
@@ -251,10 +235,10 @@ public class Socket {
     }
 
     public void connect() throws IOException {
-        LOG.log(Level.FINE, "connect");
+        log.trace("connect");
         disconnect();
         // No support for ws:// or ws:// in okhttp. See https://github.com/square/okhttp/issues/1652
-        final String httpUrl = this.endpointUri.replaceFirst("^ws:", "http:").replaceFirst("^wss:", "https:");
+        final String httpUrl = endpointUri.replaceFirst("^ws:", "http:").replaceFirst("^wss:", "https:");
         Request.Builder builder = new Request.Builder();
         if (headers != null) {
             for (Map.Entry<String, String> entry : headers.entrySet()) {
@@ -262,8 +246,7 @@ public class Socket {
             }
         }
         final Request request = builder.url(httpUrl).build();
-        final WebSocketCall wsCall = WebSocketCall.create(httpClient, request);
-        wsCall.enqueue(wsListener);
+        webSocket = httpClient.newWebSocket(request, wsListener);
     }
 
     /**
@@ -282,8 +265,8 @@ public class Socket {
      * @return A Channel instance to be used for sending and receiving events for the topic
      */
     public Channel chan(final String topic, final JsonNode payload) {
-        LOG.log(Level.FINE, "chan: {0}, {1}", new Object[]{topic, payload});
-        final Channel channel = new Channel(topic, payload, Socket.this);
+        log.trace("chan: {0}, {1}", new Object[]{topic, payload});
+        final Channel channel = new Channel(topic, payload, this);
         synchronized (channels) {
             channels.add(channel);
         }
@@ -314,7 +297,7 @@ public class Socket {
      * @throws IOException Thrown if the message cannot be sent
      */
     public Socket push(final Envelope envelope) throws IOException {
-        LOG.log(Level.FINE, "Pushing envelope: {0}", envelope);
+        log.trace("Pushing envelope: {0}", envelope);
         final ObjectNode node = objectMapper.createObjectNode();
         node.put("topic", envelope.getTopic());
         node.put("event", envelope.getEvent());
@@ -322,19 +305,18 @@ public class Socket {
         node.put("join_ref", envelope.getJoinRef());
         node.set("payload", envelope.getPayload() == null ? objectMapper.createObjectNode() : envelope.getPayload());
         final String json = objectMapper.writeValueAsString(node);
-        LOG.log(Level.FINE, "Sending JSON: {0}", json);
+        log.trace("Sending JSON: {0}", json);
 
-        RequestBody body = RequestBody.create(WebSocket.TEXT, json);
+        RequestBody body = RequestBody.create(MediaType.parse("text/xml"), json);
 
         if (this.isConnected()) {
             try {
-                webSocket.sendMessage(body);
-            }
-            catch(IllegalStateException e) {
-                LOG.log(Level.SEVERE, "Attempted to send push when socket is not open", e);
+                webSocket.send(json);
+            } catch (IllegalStateException e) {
+                log.trace("Attempted to send push when socket is not open", e);
             }
         } else {
-            this.sendBuffer.add(body);
+            sendBuffer.add(body);
         }
 
         return this;
@@ -370,7 +352,7 @@ public class Socket {
      * @return This Socket instance
      */
     public Socket onError(final IErrorCallback callback) {
-        this.errorCallbacks.add(callback);
+        Socket.this.errorCallbacks.add(callback);
         return this;
     }
 
@@ -397,6 +379,7 @@ public class Socket {
 
     /**
      * Should the socket attempt to reconnect if websocket.onFailure is called.
+     *
      * @param reconnectOnFailure reconnect value
      */
     public void reconectOnFailure(final boolean reconnectOnFailure) {
@@ -414,22 +397,16 @@ public class Socket {
         }
     }
 
-    public void setSSLSocketFactory(SSLSocketFactory sslSocketFactory) {
-        httpClient.setSslSocketFactory(sslSocketFactory);
-    }
-
-    public void setHostnameVerifier(HostnameVerifier hostnameVerifier) {
-        httpClient.setHostnameVerifier(hostnameVerifier);
+    public void removeAllChannels() {
+        synchronized (channels) {
+            channels.clear();
+        }
     }
 
     private void flushSendBuffer() {
-        while (this.isConnected() && !this.sendBuffer.isEmpty()) {
-            final RequestBody body = this.sendBuffer.removeFirst();
-            try {
-                this.webSocket.sendMessage(body);
-            } catch (IOException e) {
-                LOG.log(Level.SEVERE, "Failed to send payload {0}", body);
-            }
+        while (this.isConnected() && !sendBuffer.isEmpty()) {
+            final RequestBody body = sendBuffer.remove();
+            this.webSocket.send(body.toString());
         }
     }
 
